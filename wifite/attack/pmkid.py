@@ -21,6 +21,8 @@ class AttackPMKID(Attack):
         self.crack_result = None
         self.success = False
         self.pcapng_file = Configuration.temp('pmkid.pcapng')
+        self.keep_capturing = False
+        self.timer = None
 
 
     def get_existing_pmkid_file(self, bssid):
@@ -35,21 +37,28 @@ class AttackPMKID(Attack):
 
         bssid = bssid.lower().replace(':', '')
 
-        file_re = re.compile('.*pmkid_.*\.16800')
+        # Updated regex to match both legacy (.16800) and modern (.22000) Hashcat modes
+        file_re = re.compile(r'.*pmkid_.*\.(16800|22000)')
         for filename in os.listdir(Configuration.wpa_handshake_dir):
             pmkid_filename = os.path.join(Configuration.wpa_handshake_dir, filename)
             if not os.path.isfile(pmkid_filename):
                 continue
-            if not re.match(file_re, pmkid_filename):
+            if not file_re.match(pmkid_filename):
                 continue
 
-            with open(pmkid_filename, 'r') as pmkid_handle:
-                pmkid_hash = pmkid_handle.read().strip()
-                if pmkid_hash.count('*') < 3:
-                    continue
-                existing_bssid = pmkid_hash.split('*')[1].lower().replace(':', '')
-                if existing_bssid == bssid:
-                    return pmkid_filename
+            try:
+                with open(pmkid_filename, 'r', errors='ignore') as pmkid_handle:
+                    pmkid_hash = pmkid_handle.read().strip()
+                    if not pmkid_hash:
+                        continue
+                    # Handle both formats: * separated (16800) or WPA*01* (22000)
+                    if '*' in pmkid_hash:
+                        parts = pmkid_hash.split('*')
+                        # For 16800, BSSID is usually the second field. For 22000, fields vary.
+                        if any(bssid in part.lower().replace(':', '') for part in parts):
+                            return pmkid_filename
+            except (IOError, OSError):
+                continue
         return None
 
 
@@ -76,8 +85,8 @@ class AttackPMKID(Attack):
 
         pmkid_file = None
 
-        if Configuration.ignore_old_handshakes == False:
-            # Load exisitng PMKID hash from filesystem
+        if not Configuration.ignore_old_handshakes:
+            # Load existing PMKID hash from filesystem
             pmkid_file = self.get_existing_pmkid_file(self.target.bssid)
             if pmkid_file is not None:
                 Color.pattack('PMKID', self.target, 'CAPTURE',
@@ -112,21 +121,23 @@ class AttackPMKID(Attack):
 
         # Start hcxdumptool
         t = Thread(target=self.dumptool_thread)
+        t.daemon = True  # Ensure thread closes if main application exits unexpectedly
         t.start()
 
         # Repeatedly run pcaptool & check output for hash for self.target.essid
         pmkid_hash = None
         pcaptool = HcxPcapTool(self.target)
-        while self.timer.remaining() > 0:
-            pmkid_hash = pcaptool.get_pmkid_hash(self.pcapng_file)
-            if pmkid_hash is not None:
-                break  # Got PMKID
+        try:
+            while self.timer.remaining() > 0:
+                pmkid_hash = pcaptool.get_pmkid_hash(self.pcapng_file)
+                if pmkid_hash is not None:
+                    break  # Got PMKID
 
-            Color.pattack('PMKID', self.target, 'CAPTURE',
-                    'Waiting for PMKID ({C}%s{W})' % str(self.timer))
-            time.sleep(1)
-
-        self.keep_capturing = False
+                Color.pattack('PMKID', self.target, 'CAPTURE',
+                        'Waiting for PMKID ({C}%s{W})' % str(self.timer))
+                time.sleep(1)
+        finally:
+            self.keep_capturing = False  # Guarantees the thread stops even on errors/interrupts
 
         if pmkid_hash is None:
             Color.pattack('PMKID', self.target, 'CAPTURE',
@@ -142,7 +153,7 @@ class AttackPMKID(Attack):
 
     def crack_pmkid_file(self, pmkid_file):
         '''
-        Runs hashcat containing PMKID hash (*.16800).
+        Runs hashcat containing PMKID hash (*.16800 or *.22000).
         If cracked, saves results in self.crack_result
         Returns:
             True if cracked, False otherwise.
@@ -152,10 +163,6 @@ class AttackPMKID(Attack):
         if Configuration.wordlist is None:
             Color.pl('\n{!} {O}Not cracking PMKID ' +
                     'because there is no {R}wordlist{O} (re-run with {C}--dict{O})')
-
-            # TODO: Uncomment once --crack is updated to support recracking PMKIDs.
-            #Color.pl('{!} {O}Run Wifite with the {R}--crack{O} and {R}--dict{O} options to try again.')
-
             key = None
         else:
             Color.clear_entire_line()
@@ -193,15 +200,18 @@ class AttackPMKID(Attack):
 
     def save_pmkid(self, pmkid_hash):
         '''Saves a copy of the pmkid (handshake) to hs/ directory.'''
-        # Create handshake dir
+        # Create handshake dir safely
         if not os.path.exists(Configuration.wpa_handshake_dir):
-            os.makedirs(Configuration.wpa_handshake_dir)
+            os.makedirs(Configuration.wpa_handshake_dir, exist_ok=True)
 
         # Generate filesystem-safe filename from bssid, essid and date
-        essid_safe = re.sub('[^a-zA-Z0-9]', '', self.target.essid)
+        essid_safe = re.sub(r'[^a-zA-Z0-9]', '', self.target.essid)
         bssid_safe = self.target.bssid.replace(':', '-')
         date = time.strftime('%Y-%m-%dT%H-%M-%S')
-        pmkid_file = 'pmkid_%s_%s_%s.16800' % (essid_safe, bssid_safe, date)
+        
+        # Keep extension logic adaptable to what hcxpcaptool parsed
+        ext = '22000' if pmkid_hash.startswith('WPA*') else '16800'
+        pmkid_file = 'pmkid_%s_%s_%s.%s' % (essid_safe, bssid_safe, date, ext)
         pmkid_file = os.path.join(Configuration.wpa_handshake_dir, pmkid_file)
 
         Color.p('\n{+} Saving copy of {C}PMKID Hash{W} to {C}%s{W} ' % pmkid_file)
@@ -210,4 +220,3 @@ class AttackPMKID(Attack):
             pmkid_handle.write('\n')
 
         return pmkid_file
-
